@@ -224,28 +224,23 @@ func (w *IMAPWorker) Stop() error {
 	return nil
 }
 
-// StopFast forcefully stops the worker without graceful cleanup
 func (w *IMAPWorker) StopFast() error {
-	// Check if already stopped by testing if stopCh is nil or already closed
 	if w.stopCh == nil {
-		return nil // Never started
+		return nil
 	}
 
 	select {
 	case <-w.stopCh:
-		return nil // Already stopped
+		return nil
 	default:
-		// Still running, proceed with fast stop
 	}
 
 	w.logger.Debug("Force stopping IMAP worker for account: %s", w.accountName)
 
-	// Cancel context and close channels immediately
 	w.cancel()
 	close(w.stopCh)
 	close(w.commandCh)
 
-	// Don't wait for goroutine to finish in fast stop
 	w.logger.Debug("IMAP worker force stopped for account: %s", w.accountName)
 	return nil
 }
@@ -2097,25 +2092,27 @@ func (w *IMAPWorker) checkForNewMessages(folder string) {
 			w.mu.Unlock()
 			go w.saveTrackingStateToCache()
 
-			if w.onNewMessage != nil {
-				// Additional safety check: limit the number of notifications sent at once
-				maxNotifications := MaxNewMessageNotifications
-				notificationMessages := newMessages
-				if len(newMessages) > maxNotifications {
-					w.logger.Warn("Limiting notifications to %d messages (found %d new messages) to prevent spam",
-						maxNotifications, len(newMessages))
-					notificationMessages = newMessages[:maxNotifications]
-				}
+		w.mu.RLock()
+		callback := w.onNewMessage
+		w.mu.RUnlock()
 
-				// Create new message event
-				event := NewMessageEvent{
-					Folder:    folder,
-					Messages:  notificationMessages,
-					Count:     len(notificationMessages),
-					Timestamp: time.Now(),
-				}
-				w.onNewMessage(event)
+		if callback != nil {
+			maxNotifications := MaxNewMessageNotifications
+			notificationMessages := newMessages
+			if len(newMessages) > maxNotifications {
+				w.logger.Warn("Limiting notifications to %d messages (found %d new messages) to prevent spam",
+					maxNotifications, len(newMessages))
+				notificationMessages = newMessages[:maxNotifications]
 			}
+
+			event := NewMessageEvent{
+				Folder:    folder,
+				Messages:  notificationMessages,
+				Count:     len(notificationMessages),
+				Timestamp: time.Now(),
+			}
+			callback(event)
+		}
 		} else if currentHighestUID > lastUID {
 			// fetchNewMessages returned nothing despite a UID change. This typically
 			// means the server sent EXISTS before the message was fully delivered.
@@ -2332,10 +2329,10 @@ func (w *IMAPWorker) getHealthTicker() <-chan time.Time {
 func (w *IMAPWorker) performHealthCheck() {
 	w.mu.Lock()
 	w.lastHealthCheck = time.Now()
+	state := w.state
 	w.mu.Unlock()
 
-	// Skip health check if we're already reconnecting or connecting
-	if w.state == ConnectionStateReconnecting || w.state == ConnectionStateConnecting {
+	if state == ConnectionStateReconnecting || state == ConnectionStateConnecting {
 		return
 	}
 
@@ -3178,8 +3175,8 @@ func (w *IMAPWorker) searchMessagesInFolder(folderName string, criteria *email.S
 	}
 
 	uidSet := imap.UIDSet{}
-	for _, uid := range uids {
-		uidSet.AddNum(uid)
+	if len(uids) > 0 {
+		uidSet.AddRange(uids[0], uids[len(uids)-1])
 	}
 
 	fetchCmd := w.commandClient.Fetch(uidSet, &imap.FetchOptions{

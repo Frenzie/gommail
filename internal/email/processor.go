@@ -17,6 +17,8 @@ import (
 	"github.com/PuerkitoBio/goquery"
 )
 
+var whitespaceRe = regexp.MustCompile(`\s+`)
+
 // MessageProcessor handles parsing and processing of email messages
 type MessageProcessor struct {
 	// Configuration options for processing
@@ -486,7 +488,7 @@ func (p *MessageProcessor) extractTextFromHTML(html string) string {
 	text := doc.Text()
 
 	// Clean up whitespace
-	text = regexp.MustCompile(`\s+`).ReplaceAllString(text, " ")
+	text = whitespaceRe.ReplaceAllString(text, " ")
 	text = strings.TrimSpace(text)
 
 	return text
@@ -500,9 +502,8 @@ func (p *MessageProcessor) saveFailedMessage(rawMessage []byte, parseError error
 	filename := fmt.Sprintf("/tmp/failed-message-%s.eml", timestamp)
 
 	// Write the raw message to the file
-	err := os.WriteFile(filename, rawMessage, 0644)
+	err := os.WriteFile(filename, rawMessage, 0600)
 	if err != nil {
-		// If we can't write the file, just log it but don't fail
 		fmt.Printf("WARNING: Failed to save problematic message to %s: %v\n", filename, err)
 		return
 	}
@@ -511,7 +512,7 @@ func (p *MessageProcessor) saveFailedMessage(rawMessage []byte, parseError error
 	errorFilename := fmt.Sprintf("/tmp/failed-message-%s.error.txt", timestamp)
 	errorContent := fmt.Sprintf("Parse Error: %v\n\nMessage Size: %d bytes\nTimestamp: %s\n",
 		parseError, len(rawMessage), time.Now().Format(time.RFC3339))
-	err = os.WriteFile(errorFilename, []byte(errorContent), 0644)
+	err = os.WriteFile(errorFilename, []byte(errorContent), 0600)
 	if err != nil {
 		fmt.Printf("WARNING: Failed to save error log to %s: %v\n", errorFilename, err)
 	}

@@ -2055,6 +2055,83 @@ func (mw *MainWindow) refreshSingleAccountInUnifiedInbox(accountName string) {
 	})
 }
 
+// injectNewMessagesIntoUnifiedInboxForAccount injects already-fetched new messages for a single
+// account into the unified inbox without performing a full mailbox re-fetch.
+// This is the fast path called by the IDLE new-message callback.
+func (mw *MainWindow) injectNewMessagesIntoUnifiedInboxForAccount(accountName, folder string, messages []email.Message) {
+	mw.logger.Info("Injecting %d new messages for account %s (folder %s) into unified inbox", len(messages), accountName, folder)
+
+	// Find the account config
+	accounts := mw.config.GetAccounts()
+	var targetAccount *config.Account
+	for i := range accounts {
+		if accounts[i].Name == accountName {
+			targetAccount = &accounts[i]
+			break
+		}
+	}
+	if targetAccount == nil {
+		mw.logger.Error("injectNewMessagesIntoUnifiedInboxForAccount: account %s not found in config", accountName)
+		return
+	}
+
+	client, exists := mw.accountController.GetIMAPClientForAccount(accountName)
+	if !exists || client == nil {
+		mw.logger.Error("injectNewMessagesIntoUnifiedInboxForAccount: no IMAP client for account %s", accountName)
+		return
+	}
+
+	// Create SMTP client for this account
+	smtpClient := smtp.NewClient(email.ServerConfig{
+		Host:     targetAccount.SMTP.Host,
+		Port:     targetAccount.SMTP.Port,
+		Username: targetAccount.SMTP.Username,
+		Password: targetAccount.SMTP.Password,
+		TLS:      targetAccount.SMTP.TLS,
+	})
+
+	// Convert to MessageIndexItem
+	indexItems := make([]email.MessageIndexItem, 0, len(messages))
+	for _, msg := range messages {
+		indexItems = append(indexItems, email.MessageIndexItem{
+			Message:      msg,
+			AccountName:  targetAccount.Name,
+			AccountEmail: targetAccount.Email,
+			FolderName:   folder,
+			IMAPClient:   client,
+			SMTPClient:   smtpClient,
+			AccountConfig: &email.AccountConfig{
+				Name:        targetAccount.Name,
+				Email:       targetAccount.Email,
+				DisplayName: targetAccount.DisplayName,
+			},
+		})
+	}
+
+	// Merge into the unified inbox on the UI goroutine
+	fyne.Do(func() {
+		if !mw.accountController.IsUnifiedInbox() {
+			mw.logger.Debug("User switched away from unified inbox, skipping inject")
+			return
+		}
+
+		beforeCount := len(mw.messages)
+		mw.mergeNewMessagesIntoUnifiedInbox(indexItems)
+		afterCount := len(mw.messages)
+		addedCount := afterCount - beforeCount
+
+		if addedCount > 0 {
+			mw.logger.Info("Injected %d new messages from account %s (total now: %d)", addedCount, accountName, afterCount)
+			mw.sortMessages()
+			mw.messageList.UnselectAll()
+			mw.refreshMessageList()
+			mw.statusBar.SetText(fmt.Sprintf("New messages from %s (%d)", accountName, addedCount))
+		} else {
+			mw.logger.Debug("No new messages to inject from account %s (all were duplicates)", accountName)
+		}
+	})
+}
+
 // mergeNewMessagesIntoUnifiedInbox merges new messages into the existing unified inbox, avoiding duplicates
 func (mw *MainWindow) mergeNewMessagesIntoUnifiedInbox(newMessages []email.MessageIndexItem) {
 	if len(newMessages) == 0 {
@@ -6626,29 +6703,51 @@ func (mw *MainWindow) startFolderMonitoring(folder string) {
 
 	// Set up new message callback for monitoring
 	mw.imapClient.SetNewMessageCallback(func(updatedFolder string, messages []email.Message) {
-		// On new message callback: refresh messages when changes are detected
+		// On new message callback: inject new messages directly to avoid a full mailbox re-fetch.
 		mw.logger.Info("Real-time update detected in folder: %s (%d messages)", updatedFolder, len(messages))
 
-		// Only refresh if it's the currently selected folder
+		// Only update if it's the currently selected folder
 		currentFolder := mw.folderController.GetCurrentFolder()
 		if updatedFolder == currentFolder {
-			fyne.Do(func() {
-				mw.statusBar.SetText(fmt.Sprintf("New messages detected in %s, refreshing...", updatedFolder))
-			})
-
-			// Use RefreshCoordinator to refresh messages
-			mw.refreshMessagesDebounced(updatedFolder, func(err error) {
-				if err != nil {
-					mw.logger.Error("Failed to refresh messages after real-time update: %v", err)
-					fyne.Do(func() {
-						mw.statusBar.SetText(fmt.Sprintf("Failed to refresh %s: %v", updatedFolder, err))
-					})
-				} else {
-					fyne.Do(func() {
-						mw.statusBar.SetText(fmt.Sprintf("Refreshed %s with new messages", updatedFolder))
+			if len(messages) > 0 {
+				// Fast path: inject only the newly arrived messages without re-fetching everything.
+				fyne.Do(func() {
+					indexItems := mw.convertMessagesToIndexItems(messages, updatedFolder)
+					mw.mergeNewMessagesIntoUnifiedInbox(indexItems)
+					mw.sortMessages()
+					mw.messageList.UnselectAll()
+					mw.refreshMessageList()
+					mw.statusBar.SetText(fmt.Sprintf("New messages in %s (%d)", updatedFolder, len(messages)))
+				})
+				// If the delivery was capped (too many messages at once), schedule a background
+				// full refresh to pick up any that were not included in the notification.
+				if len(messages) >= imap.MaxNewMessageNotifications {
+					mw.logger.Info("Notification cap reached for folder %s, scheduling follow-up full refresh", updatedFolder)
+					mw.refreshMessagesDebounced(updatedFolder, func(err error) {
+						if err != nil {
+							mw.logger.Error("Failed to do follow-up refresh for folder %s: %v", updatedFolder, err)
+						}
 					})
 				}
-			})
+			} else {
+				// Fallback: server signalled a change but no messages were available yet;
+				// do a full refresh so the UI stays consistent.
+				fyne.Do(func() {
+					mw.statusBar.SetText(fmt.Sprintf("New messages detected in %s, refreshing...", updatedFolder))
+				})
+				mw.refreshMessagesDebounced(updatedFolder, func(err error) {
+					if err != nil {
+						mw.logger.Error("Failed to refresh messages after real-time update: %v", err)
+						fyne.Do(func() {
+							mw.statusBar.SetText(fmt.Sprintf("Failed to refresh %s: %v", updatedFolder, err))
+						})
+					} else {
+						fyne.Do(func() {
+							mw.statusBar.SetText(fmt.Sprintf("Refreshed %s with new messages", updatedFolder))
+						})
+					}
+				})
+			}
 		}
 	})
 
@@ -6809,16 +6908,33 @@ func (mw *MainWindow) startUnifiedInboxMonitoring() {
 				mw.deleteOperationMutex.RUnlock()
 
 				if !deleteInProgress {
-					fyne.Do(func() {
-						mw.statusBar.SetText(fmt.Sprintf("New messages detected in %s, refreshing...", capturedAccountName))
-					})
-
-					// Fetch fresh messages from just this account and merge them
-					mw.backgroundWg.Add(1)
-					go func() {
-						defer mw.backgroundWg.Done()
-						mw.refreshSingleAccountInUnifiedInbox(capturedAccountName)
-					}()
+					if len(messages) > 0 {
+						// Fast path: inject only the newly arrived messages without re-fetching the whole mailbox.
+						mw.backgroundWg.Add(1)
+						go func() {
+							defer mw.backgroundWg.Done()
+							mw.injectNewMessagesIntoUnifiedInboxForAccount(capturedAccountName, updatedFolder, messages)
+						}()
+						// If the delivery was capped, schedule a full refresh to pick up any missed messages.
+						if len(messages) >= imap.MaxNewMessageNotifications {
+							mw.logger.Info("Notification cap reached for account %s, scheduling follow-up full refresh", capturedAccountName)
+							mw.backgroundWg.Add(1)
+							go func() {
+								defer mw.backgroundWg.Done()
+								mw.refreshSingleAccountInUnifiedInbox(capturedAccountName)
+							}()
+						}
+					} else {
+						// Fallback: server signalled a change but no messages were available yet; full refresh.
+						fyne.Do(func() {
+							mw.statusBar.SetText(fmt.Sprintf("New messages detected in %s, refreshing...", capturedAccountName))
+						})
+						mw.backgroundWg.Add(1)
+						go func() {
+							defer mw.backgroundWg.Done()
+							mw.refreshSingleAccountInUnifiedInbox(capturedAccountName)
+						}()
+					}
 				} else {
 					mw.logger.Debug("Skipping unified inbox refresh due to delete operation in progress (account: %s, folder: %s)", capturedAccountName, updatedFolder)
 				}

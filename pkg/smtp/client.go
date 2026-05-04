@@ -310,16 +310,26 @@ func (c *Client) writeMultipartWithAttachments(mw *message.Writer, msg *email.Me
 	// The message writer should already be set up for multipart/mixed
 	// Write message body part first
 	if msg.Body.HTML != "" && msg.Body.Text != "" {
-		// Create multipart/alternative for the body
-		var bodyHeader message.Header
-		bodyHeader.Set("Content-Type", "multipart/alternative")
-		bodyPart, err := mw.CreatePart(bodyHeader)
+		var textHeader message.Header
+		textHeader.Set("Content-Type", "text/plain; charset=utf-8")
+		textPart, err := mw.CreatePart(textHeader)
+		if err != nil {
+			return err
+		}
+		_, err = io.WriteString(textPart, msg.Body.Text)
+		textPart.Close()
 		if err != nil {
 			return err
 		}
 
-		err = c.writeMultipartAlternative(bodyPart, msg)
-		bodyPart.Close()
+		var htmlHeader message.Header
+		htmlHeader.Set("Content-Type", "text/html; charset=utf-8")
+		htmlPart, err := mw.CreatePart(htmlHeader)
+		if err != nil {
+			return err
+		}
+		_, err = io.WriteString(htmlPart, msg.Body.HTML)
+		htmlPart.Close()
 		if err != nil {
 			return err
 		}

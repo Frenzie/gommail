@@ -2,6 +2,8 @@ package imap
 
 import (
 	"context"
+	"crypto/rand"
+	"math/big"
 	"time"
 
 	"github.com/wltechblog/gommail/internal/email"
@@ -236,8 +238,14 @@ func generateCommandID() string {
 func randomString(length int) string {
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	b := make([]byte, length)
+	charsetLen := big.NewInt(int64(len(charset)))
 	for i := range b {
-		b[i] = charset[time.Now().UnixNano()%int64(len(charset))]
+		n, err := rand.Int(rand.Reader, charsetLen)
+		if err != nil {
+			b[i] = charset[0]
+			continue
+		}
+		b[i] = charset[n.Int64()]
 	}
 	return string(b)
 }
